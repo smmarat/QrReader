@@ -28,6 +28,6 @@ public class ResultActivity extends Activity {
         if (s!=null) {
             tw.setText(s);
         }
-        setContentView(tw, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.FILL_PARENT, ViewGroup.LayoutParams.FILL_PARENT));
+        setContentView(tw, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
     }
 }

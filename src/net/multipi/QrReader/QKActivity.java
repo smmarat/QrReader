@@ -26,10 +26,10 @@ import java.util.Vector;
 public class QKActivity extends Activity implements SurfaceHolder.Callback, Camera.PreviewCallback, Camera.AutoFocusCallback {
     private Camera camera;
     private SurfaceView preview;
-    private Handler handler = new Handler(Looper.myLooper());
-    private boolean isOk;
     private ViewfinderView vfv;
     private Result rawResult;
+    private String TAG = QKActivity.class.getSimpleName();
+    private long currKey;
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
@@ -44,28 +44,23 @@ public class QKActivity extends Activity implements SurfaceHolder.Callback, Came
         preview = new SurfaceView(this);
         SurfaceHolder surfaceHolder = preview.getHolder();
         surfaceHolder.addCallback(this);
-        surfaceHolder.setType(SurfaceHolder.SURFACE_TYPE_PUSH_BUFFERS);
-        fl.addView(preview, LayoutParams.FILL_PARENT, LayoutParams.FILL_PARENT);
+        fl.addView(preview, LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT);
         vfv = new ViewfinderView(this, null);
-        fl.addView(vfv, LayoutParams.FILL_PARENT, LayoutParams.FILL_PARENT);
+        fl.addView(vfv, LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT);
         setContentView(fl);
-        isOk = false;
-    }
-
-    public Camera getCamera() {
-        return this.camera;
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         camera = Camera.open();
+        vfv.setCamera(camera);
+        currKey = System.currentTimeMillis();
     }
 
     @Override
     protected void onPause() {
         super.onPause();
-
         if (camera != null) {
             camera.setPreviewCallback(null);
             camera.stopPreview();
@@ -110,58 +105,7 @@ public class QKActivity extends Activity implements SurfaceHolder.Callback, Came
 
     @Override
     public void onPreviewFrame(final byte[] bytes, final Camera camera) {
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    Size previewSize = camera.getParameters().getPreviewSize();
-                    Rect rect = vfv.getFramingRectInPreview();
-                    LuminanceSource source = new PlanarYUVLuminanceSource(bytes, previewSize.width, previewSize.height, rect.left, rect.top,
-                            rect.width(), rect.height(), false);
-
-                    Map<DecodeHintType,Object> hints = new HashMap<DecodeHintType, Object>();
-                    Vector<BarcodeFormat> decodeFormats = new Vector<BarcodeFormat>(1);
-                    decodeFormats.add(BarcodeFormat.QR_CODE);
-                    hints.put(DecodeHintType.POSSIBLE_FORMATS, decodeFormats);
-                    hints.put(DecodeHintType.NEED_RESULT_POINT_CALLBACK, new ResultPointCallback() {
-                        @Override
-                        public void foundPossibleResultPoint(ResultPoint resultPoint) {
-                            vfv.addPossibleResultPoint(resultPoint);
-                        }
-                    });
-
-                    MultiFormatReader mfr = new MultiFormatReader();
-                    mfr.setHints(hints);
-
-                    try {
-                        BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(source));
-                        rawResult = mfr.decodeWithState(bitmap);
-                    } catch (NotFoundException nfe) {
-                        nfe.printStackTrace();
-                    }
-                    if (rawResult!=null) {
-                        Log.e("QKActivity", rawResult.getText());
-                        synchronized (this) {
-                            if (!isOk) {
-                                isOk = true;
-                                handler.post(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        Intent i = new Intent(QKActivity.this, ResultActivity.class);
-                                        i.putExtra(ResultActivity.RESULT, rawResult.getText());
-                                        i.setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP);
-                                        startActivity(i);
-                                    }
-                                });
-                            }
-                        }
-                    }
-
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
-            }
-        }).start();
+        new Recognizer(currKey, bytes).start();
     }
 
     @Override
@@ -170,7 +114,7 @@ public class QKActivity extends Activity implements SurfaceHolder.Callback, Came
             @Override
             public void run() {
                 try {
-                    Thread.sleep(4000);
+                    Thread.sleep(2000);
                 } catch (InterruptedException e) {
                     e.printStackTrace();
                 }
@@ -180,5 +124,58 @@ public class QKActivity extends Activity implements SurfaceHolder.Callback, Came
                 }
             }
         }).start();
+    }
+
+    public class Recognizer extends Thread {
+
+        private long key;
+        private byte[] bytes;
+
+        public Recognizer(long key, byte[] bytes) {
+            this.key = key;
+            this.bytes = bytes;
+        }
+
+        @Override
+        public void run() {
+            try {
+                Size previewSize = camera.getParameters().getPreviewSize();
+                Rect rect = vfv.getFramingRectInPreview();
+                LuminanceSource source = new PlanarYUVLuminanceSource(bytes, previewSize.width, previewSize.height, rect.left, rect.top,
+                        rect.width(), rect.height(), false);
+
+                Map<DecodeHintType,Object> hints = new HashMap<DecodeHintType, Object>();
+                Vector<BarcodeFormat> decodeFormats = new Vector<BarcodeFormat>(1);
+                decodeFormats.add(BarcodeFormat.QR_CODE);
+                hints.put(DecodeHintType.POSSIBLE_FORMATS, decodeFormats);
+                hints.put(DecodeHintType.NEED_RESULT_POINT_CALLBACK, new ResultPointCallback() {
+                    @Override
+                    public void foundPossibleResultPoint(ResultPoint resultPoint) {
+                        vfv.addPossibleResultPoint(resultPoint);
+                    }
+                });
+                MultiFormatReader mfr = new MultiFormatReader();
+                mfr.setHints(hints);
+                BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(source));
+                rawResult = mfr.decodeWithState(bitmap);
+                if (rawResult!=null) {
+                    Log.e(TAG, rawResult.getText()+" key="+key+" currKey="+currKey);
+                    if (key==currKey) {
+                        currKey = System.currentTimeMillis();
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                Intent i = new Intent(QKActivity.this, ResultActivity.class);
+                                i.putExtra(ResultActivity.RESULT, rawResult.getText());
+                                i.setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                                startActivity(i);
+                            }
+                        });
+                    }
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
     }
 }

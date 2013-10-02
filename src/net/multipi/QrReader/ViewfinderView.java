@@ -21,14 +21,16 @@ import android.content.res.Resources;
 import android.graphics.*;
 import android.hardware.Camera;
 import android.util.AttributeSet;
+import android.util.Log;
 import android.view.Display;
 import android.view.View;
 import android.view.WindowManager;
 import com.google.zxing.ResultPoint;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
-import java.util.regex.Pattern;
 
 /**
  * This view is overlaid on top of the camera preview. It adds the viewfinder rectangle and partial
@@ -38,215 +40,265 @@ import java.util.regex.Pattern;
  */
 public final class ViewfinderView extends View {
 
-    private static final int[] SCANNER_ALPHA = {0, 64, 128, 192, 255, 192, 128, 64};
-    private static final long ANIMATION_DELAY = 80L;
-    private static final int CURRENT_POINT_OPACITY = 0xA0;
-    private static final int MAX_RESULT_POINTS = 20;
+  private static final long ANIMATION_DELAY = 80L;
+  private static final int CURRENT_POINT_OPACITY = 0xA0;
+  private static final int MAX_RESULT_POINTS = 20;
+  private static final int POINT_SIZE = 6;
 
     private static final int MIN_FRAME_WIDTH = 240;
     private static final int MIN_FRAME_HEIGHT = 240;
-    private static final int MAX_FRAME_WIDTH = 480;
-    private static final int MAX_FRAME_HEIGHT = 360;
+    private static final int MAX_FRAME_WIDTH = 960; // = 1920/2
+    private static final int MAX_FRAME_HEIGHT = 540; // = 1080/2
 
-    private static final Pattern COMMA_PATTERN = Pattern.compile(",");
+    private static final int MIN_PREVIEW_PIXELS = 470 * 320; // normal screen
+    private static final int MAX_PREVIEW_PIXELS = 1280 * 800;
 
-    private final Paint paint;
-    private final int maskColor;
-    private final int frameColor;
-    private final int resultPointColor;
-    private List<ResultPoint> possibleResultPoints;
-    private List<ResultPoint> lastPossibleResultPoints;
-    private QKActivity act;
+  private Camera camera;
+  private final Paint paint;
+  private Bitmap resultBitmap;
+  private final int maskColor;
+  private final int resultColor;
+  private final int resultPointColor;
+  private List<ResultPoint> possibleResultPoints;
+  private List<ResultPoint> lastPossibleResultPoints;
+    private String TAG = ViewfinderView.class.getSimpleName();
+    private Rect framingRect,framingRectInPreview;
 
-    // This constructor is used when the class is built from an XML resource.
-    public ViewfinderView(QKActivity context, AttributeSet attrs) {
-        super(context, attrs);
-        this.act = context;
+  // This constructor is used when the class is built from an XML resource.
+  public ViewfinderView(Context context, AttributeSet attrs) {
+    super(context, attrs);
 
-        // Initialize these once for performance rather than calling them every time in onDraw().
-        paint = new Paint();
-        Resources resources = getResources();
-        maskColor = Color.parseColor("#60000000");
-        frameColor = Color.BLACK;
-        resultPointColor = Color.YELLOW;
-        possibleResultPoints = new ArrayList<ResultPoint>(5);
+    // Initialize these once for performance rather than calling them every time in onDraw().
+    paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    Resources resources = getResources();
+    maskColor = resources.getColor(R.color.viewfinder_mask);
+    resultColor = resources.getColor(R.color.result_view);
+    resultPointColor = resources.getColor(R.color.possible_result_points);
+    possibleResultPoints = new ArrayList<ResultPoint>(5);
+    lastPossibleResultPoints = null;
+  }
+
+  public void setCamera(Camera camera) {
+    this.camera = camera;
+  }
+
+  @Override
+  public void onDraw(Canvas canvas) {
+    Rect frame = getFramingRect();
+    int width = canvas.getWidth();
+    int height = canvas.getHeight();
+
+    // Draw the exterior (i.e. outside the framing rect) darkened
+    paint.setColor(resultBitmap != null ? resultColor : maskColor);
+    canvas.drawRect(0, 0, width, frame.top, paint);
+    canvas.drawRect(0, frame.top, frame.left, frame.bottom + 1, paint);
+    canvas.drawRect(frame.right + 1, frame.top, width, frame.bottom + 1, paint);
+    canvas.drawRect(0, frame.bottom + 1, width, height, paint);
+
+    if (resultBitmap != null) {
+      // Draw the opaque result bitmap over the scanning rectangle
+      paint.setAlpha(CURRENT_POINT_OPACITY);
+      canvas.drawBitmap(resultBitmap, null, frame, paint);
+    } else {
+
+      Rect previewFrame = getFramingRectInPreview();
+      float scaleX = frame.width() / (float) previewFrame.width();
+      float scaleY = frame.height() / (float) previewFrame.height();
+
+      List<ResultPoint> currentPossible = possibleResultPoints;
+      List<ResultPoint> currentLast = lastPossibleResultPoints;
+      int frameLeft = frame.left;
+      int frameTop = frame.top;
+      if (currentPossible.isEmpty()) {
         lastPossibleResultPoints = null;
+      } else {
+        possibleResultPoints = new ArrayList<ResultPoint>(5);
+        lastPossibleResultPoints = currentPossible;
+        paint.setAlpha(CURRENT_POINT_OPACITY);
+        paint.setColor(resultPointColor);
+        synchronized (currentPossible) {
+          for (ResultPoint point : currentPossible) {
+            canvas.drawCircle(frameLeft + (int) (point.getX() * scaleX),
+                              frameTop + (int) (point.getY() * scaleY),
+                              POINT_SIZE, paint);
+          }
+        }
+      }
+      if (currentLast != null) {
+        paint.setAlpha(CURRENT_POINT_OPACITY / 2);
+        paint.setColor(resultPointColor);
+        synchronized (currentLast) {
+          float radius = POINT_SIZE / 2.0f;
+          for (ResultPoint point : currentLast) {
+            canvas.drawCircle(frameLeft + (int) (point.getX() * scaleX),
+                              frameTop + (int) (point.getY() * scaleY),
+                              radius, paint);
+          }
+        }
+      }
+
+      // Request another update at the animation interval, but only repaint the laser line,
+      // not the entire viewfinder mask.
+      postInvalidateDelayed(ANIMATION_DELAY,
+                            frame.left - POINT_SIZE,
+                            frame.top - POINT_SIZE,
+                            frame.right + POINT_SIZE,
+                            frame.bottom + POINT_SIZE);
+    }
+  }
+
+  public void addPossibleResultPoint(ResultPoint point) {
+    List<ResultPoint> points = possibleResultPoints;
+    synchronized (points) {
+      points.add(point);
+      int size = points.size();
+      if (size > MAX_RESULT_POINTS) {
+        // trim it
+        points.subList(0, size - MAX_RESULT_POINTS / 2).clear();
+      }
+    }
+  }
+
+    public synchronized Rect getFramingRectInPreview() {
+        if (framingRectInPreview == null) {
+            if (camera==null) throw new IllegalStateException("Camera is null!");
+            Rect framingRect = getFramingRect();
+            if (framingRect == null) {
+                return null;
+            }
+            Rect rect = new Rect(framingRect);
+            Point cameraResolution = findBestPreviewSizeValue(camera.getParameters());
+            Point screenResolution = getScreenResolution();
+            if (cameraResolution == null || screenResolution == null) {
+                // Called early, before init even finished
+                return null;
+            }
+            rect.left = rect.left * cameraResolution.x / screenResolution.x;
+            rect.right = rect.right * cameraResolution.x / screenResolution.x;
+            rect.top = rect.top * cameraResolution.y / screenResolution.y;
+            rect.bottom = rect.bottom * cameraResolution.y / screenResolution.y;
+            framingRectInPreview = rect;
+        }
+        return framingRectInPreview;
     }
 
-    @Override
-    public void onDraw(Canvas canvas) {
-        Rect frame = getFramingRect();
-        if (frame == null) {
-            return;
-        }
-        int width = canvas.getWidth();
-        int height = canvas.getHeight();
-
-        paint.setColor(maskColor);
-        canvas.drawRect(0, 0, width, frame.top, paint);
-        canvas.drawRect(0, frame.top, frame.left, frame.bottom + 1, paint);
-        canvas.drawRect(frame.right + 1, frame.top, width, frame.bottom + 1, paint);
-        canvas.drawRect(0, frame.bottom + 1, width, height, paint);
-
-        paint.setColor(frameColor);
-        canvas.drawRect(frame.left, frame.top, frame.right + 1, frame.top + 2, paint);
-        canvas.drawRect(frame.left, frame.top + 2, frame.left + 2, frame.bottom - 1, paint);
-        canvas.drawRect(frame.right - 1, frame.top, frame.right + 1, frame.bottom - 1, paint);
-        canvas.drawRect(frame.left, frame.bottom - 1, frame.right + 1, frame.bottom + 1, paint);
-
-        // Draw a red "laser scanner" line through the middle to show decoding is active
-//        paint.setColor(laserColor);
-//        paint.setAlpha(SCANNER_ALPHA[scannerAlpha]);
-//        scannerAlpha = (scannerAlpha + 1) % SCANNER_ALPHA.length;
-//        int middle = frame.height() / 2 + frame.top;
-//        canvas.drawRect(frame.left + 2, middle - 1, frame.right - 1, middle + 2, paint);
-
-        Rect previewFrame = getFramingRectInPreview();
-        float scaleX = frame.width() / (float) previewFrame.width();
-        float scaleY = frame.height() / (float) previewFrame.height();
-
-        List<ResultPoint> currentPossible = possibleResultPoints;
-        List<ResultPoint> currentLast = lastPossibleResultPoints;
-        if (currentPossible.isEmpty()) {
-            lastPossibleResultPoints = null;
-        } else {
-            possibleResultPoints = new ArrayList<ResultPoint>(5);
-            lastPossibleResultPoints = currentPossible;
-            paint.setAlpha(CURRENT_POINT_OPACITY);
-            paint.setColor(resultPointColor);
-            synchronized (currentPossible) {
-                for (ResultPoint point : currentPossible) {
-                    canvas.drawCircle((int) (point.getX() * scaleX),
-                            (int) (point.getY() * scaleY),
-                            6.0f, paint);
-                }
+    public synchronized Rect getFramingRect() {
+        if (framingRect == null) {
+            Point screenResolution = getScreenResolution();
+            if (screenResolution == null) {
+                // Called early, before init even finished
+                return null;
             }
+
+            int width = findDesiredDimensionInRange(screenResolution.x, MIN_FRAME_WIDTH, MAX_FRAME_WIDTH);
+            int height = findDesiredDimensionInRange(screenResolution.y, MIN_FRAME_HEIGHT, MAX_FRAME_HEIGHT);
+
+            int leftOffset = (screenResolution.x - width) / 2;
+            int topOffset = (screenResolution.y - height) / 2;
+            framingRect = new Rect(leftOffset, topOffset, leftOffset + width, topOffset + height);
+            Log.d(TAG, "Calculated framing rect: " + framingRect);
         }
-        if (currentLast != null) {
-            paint.setAlpha(CURRENT_POINT_OPACITY / 2);
-            paint.setColor(resultPointColor);
-            synchronized (currentLast) {
-                for (ResultPoint point : currentLast) {
-                    canvas.drawCircle((int) (point.getX() * scaleX),
-                            (int) (point.getY() * scaleY),
-                            3.0f, paint);
-                }
-            }
-        }
-        postInvalidateDelayed(ANIMATION_DELAY, frame.left, frame.top, frame.right, frame.bottom);
+        return framingRect;
     }
 
-    public void addPossibleResultPoint(ResultPoint point) {
-        List<ResultPoint> points = possibleResultPoints;
-        synchronized (point) {
-            points.add(point);
-            int size = points.size();
-            if (size > MAX_RESULT_POINTS) {
-                // trim it
-                points.subList(0, size - MAX_RESULT_POINTS / 2).clear();
-            }
-        }
-    }
 
+    private static int findDesiredDimensionInRange(int resolution, int hardMin, int hardMax) {
+        int dim = resolution / 2; // Target 50% of each dimension
+        if (dim < hardMin) {
+            return hardMin;
+        }
+        if (dim > hardMax) {
+            return hardMax;
+        }
+        return dim;
+    }
 
     private Point getScreenResolution() {
         WindowManager manager = (WindowManager) getContext().getSystemService(Context.WINDOW_SERVICE);
         Display display = manager.getDefaultDisplay();
-        return new Point(display.getWidth(), display.getHeight());
+        int width = display.getWidth();
+        int height = display.getHeight();
+        // We're landscape-only, and have apparently seen issues with display thinking it's portrait
+        // when waking from sleep. If it's not landscape, assume it's mistaken and reverse them:
+        if (width < height) {
+            Log.i(TAG, "Display reports portrait orientation; assuming this is incorrect");
+            int temp = width;
+            width = height;
+            height = temp;
+        }
+        return new Point(width, height);
     }
 
-    public Rect getFramingRect() {
-        Camera camera = act.getCamera();
-        if (camera == null) {
-            return null;
+    private Point findBestPreviewSizeValue(Camera.Parameters parameters) {
+
+        List<Camera.Size> rawSupportedSizes = parameters.getSupportedPreviewSizes();
+        if (rawSupportedSizes == null) {
+            Log.w(TAG, "Device returned no supported preview sizes; using default");
+            Camera.Size defaultSize = parameters.getPreviewSize();
+            return new Point(defaultSize.width, defaultSize.height);
         }
 
+        // Sort by size, descending
+        List<Camera.Size> supportedPreviewSizes = new ArrayList<Camera.Size>(rawSupportedSizes);
+        Collections.sort(supportedPreviewSizes, new Comparator<Camera.Size>() {
+            @Override
+            public int compare(Camera.Size a, Camera.Size b) {
+                int aPixels = a.height * a.width;
+                int bPixels = b.height * b.width;
+                if (bPixels < aPixels) {
+                    return -1;
+                }
+                if (bPixels > aPixels) {
+                    return 1;
+                }
+                return 0;
+            }
+        });
+
+        if (Log.isLoggable(TAG, Log.INFO)) {
+            StringBuilder previewSizesString = new StringBuilder();
+            for (Camera.Size supportedPreviewSize : supportedPreviewSizes) {
+                previewSizesString.append(supportedPreviewSize.width).append('x')
+                        .append(supportedPreviewSize.height).append(' ');
+            }
+            Log.i(TAG, "Supported preview sizes: " + previewSizesString);
+        }
+
+        Point bestSize = null;
         Point screenResolution = getScreenResolution();
-        int width = screenResolution.x * 3 / 4;
-        if (width < MIN_FRAME_WIDTH) {
-            width = MIN_FRAME_WIDTH;
-        } else if (width > MAX_FRAME_WIDTH) {
-            width = MAX_FRAME_WIDTH;
-        }
-        int height = screenResolution.y * 3 / 4;
-        if (height < MIN_FRAME_HEIGHT) {
-            height = MIN_FRAME_HEIGHT;
-        } else if (height > MAX_FRAME_HEIGHT) {
-            height = MAX_FRAME_HEIGHT;
-        }
-        int leftOffset = (screenResolution.x - width) / 2;
-        int topOffset = (screenResolution.y - height) / 2;
-       return new Rect(leftOffset, topOffset, leftOffset + width, topOffset + height);
-    }
+        float screenAspectRatio = (float) screenResolution.x / (float) screenResolution.y;
 
-    public Rect getFramingRectInPreview() {
-        Rect rect = new Rect(getFramingRect());
-        Point cameraResolution = getCameraResolution();
-        Point screenResolution = getScreenResolution();
-        rect.left = rect.left * cameraResolution.x / screenResolution.x;
-        rect.right = rect.right * cameraResolution.x / screenResolution.x;
-        rect.top = rect.top * cameraResolution.y / screenResolution.y;
-        rect.bottom = rect.bottom * cameraResolution.y / screenResolution.y;
-        return rect;
-    }
-
-    private Point getCameraResolution() {
-        Camera camera = act.getCamera();
-        String previewSizeValueString = camera.getParameters().get("preview-size-values");
-        // saw this on Xperia
-        if (previewSizeValueString == null) {
-            previewSizeValueString = camera.getParameters().get("preview-size-value");
-        }
-        Point cameraResolution = null;
-        Point screenResolution = getScreenResolution();
-        if (previewSizeValueString != null) {
-            cameraResolution = findBestPreviewSizeValue(previewSizeValueString, screenResolution);
-        }
-        if (cameraResolution == null) {
-            // Ensure that the camera resolution is a multiple of 8, as the screen may not be.
-            cameraResolution = new Point(
-                    (screenResolution.x >> 3) << 3,
-                    (screenResolution.y >> 3) << 3);
-        }
-        return cameraResolution;
-    }
-
-    private Point findBestPreviewSizeValue(CharSequence previewSizeValueString,
-                                           Point screenResolution) {
-        int bestX = 0;
-        int bestY = 0;
-        int diff = Integer.MAX_VALUE;
-        for (String previewSize : COMMA_PATTERN.split(previewSizeValueString)) {
-            previewSize = previewSize.trim();
-            int dimPosition = previewSize.indexOf('x');
-            if (dimPosition < 0) {
+        float diff = Float.POSITIVE_INFINITY;
+        for (Camera.Size supportedPreviewSize : supportedPreviewSizes) {
+            int realWidth = supportedPreviewSize.width;
+            int realHeight = supportedPreviewSize.height;
+            int pixels = realWidth * realHeight;
+            if (pixels < MIN_PREVIEW_PIXELS || pixels > MAX_PREVIEW_PIXELS) {
                 continue;
             }
-
-            int newX;
-            int newY;
-            try {
-                newX = Integer.parseInt(previewSize.substring(0, dimPosition));
-                newY = Integer.parseInt(previewSize.substring(dimPosition + 1));
-            } catch (NumberFormatException nfe) {
-                continue;
+            boolean isCandidatePortrait = realWidth < realHeight;
+            int maybeFlippedWidth = isCandidatePortrait ? realHeight : realWidth;
+            int maybeFlippedHeight = isCandidatePortrait ? realWidth : realHeight;
+            if (maybeFlippedWidth == screenResolution.x && maybeFlippedHeight == screenResolution.y) {
+                Point exactPoint = new Point(realWidth, realHeight);
+                Log.i(TAG, "Found preview size exactly matching screen size: " + exactPoint);
+                return exactPoint;
             }
-
-            int newDiff = Math.abs(newX - screenResolution.x) + Math.abs(newY - screenResolution.y);
-            if (newDiff == 0) {
-                bestX = newX;
-                bestY = newY;
-                break;
-            } else if (newDiff < diff) {
-                bestX = newX;
-                bestY = newY;
+            float aspectRatio = (float) maybeFlippedWidth / (float) maybeFlippedHeight;
+            float newDiff = Math.abs(aspectRatio - screenAspectRatio);
+            if (newDiff < diff) {
+                bestSize = new Point(realWidth, realHeight);
                 diff = newDiff;
             }
+        }
 
+        if (bestSize == null) {
+            Camera.Size defaultSize = parameters.getPreviewSize();
+            bestSize = new Point(defaultSize.width, defaultSize.height);
+            Log.i(TAG, "No suitable preview sizes, using default: " + bestSize);
         }
-        if (bestX > 0 && bestY > 0) {
-            return new Point(bestX, bestY);
-        }
-        return null;
+
+        Log.i(TAG, "Found best approximate preview size: " + bestSize);
+        return bestSize;
     }
 }
